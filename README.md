@@ -4,9 +4,14 @@ A small web prototype for realistic, low-pressure support so undergraduate resea
 
 ## What it does (MVP)
 
-- **Before:** Profile (interests, goals, LinkedIn, how you feel), optional resume upload, PDF schedule upload with heuristic session parsing.
-- **During:** Generate three short, personalized questions per session (uses your profile + session details).
-- **After:** End-of-day reflection with summary and follow-up ideas (markdown).
+- **Sign up / Log in:** Username and password; passwords are hashed (PBKDF2) and stored in a local SQLite database.
+- **My profile:** Interests, LinkedIn URL, and resume (PDF or TXT). Click **Save profile** to persist; these load automatically on future visits.
+- **My conferences:** Add as many conferences as you like. Pick the active conference from the dropdown. Each conference has:
+  - **Prep & schedule:** Name, goals, how you feel, schedule PDF upload (heuristic parsing), save.
+  - **Session coach:** Three personalized questions per session (uses saved profile + this conference’s goals/feelings).
+  - **End of day:** Reflection and AI synthesis (if `OPENAI_API_KEY` is set).
+
+Data is stored locally in `data/app.db` (gitignored). This is suitable for local development; for a public deployment you would add HTTPS, stronger auth, and a hosted database.
 
 ## Setup
 
