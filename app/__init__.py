@@ -1,0 +1,1 @@
+# Conference scaffolding application package.
