@@ -26,6 +26,7 @@ from app.db import (
     list_contacts,
     list_contacts_for_conference,
     row_to_dict,
+    update_contact,
     update_conference,
     update_user_profile,
 )
@@ -45,6 +46,19 @@ NAV_CONTACTS = "Contacts"
 NAV_CALENDAR = "Calendar & exports"
 NAV_PRIVACY = "Privacy"
 
+# Limits (shown in UI; keep in sync with parsing below)
+PROFILE_PIC_MAX_BYTES = 500 * 1024  # 500 KiB — max size we accept for profile photos
+RESUME_TEXT_MAX_CHARS = 12_000  # extracted text kept for storage / AI prompts
+
+PROFILE_PIC_HELP = (
+    f"Profile picture must be **{PROFILE_PIC_MAX_BYTES // 1024} KB** or smaller. "
+    "The widget may show a much larger browser upload limit (e.g. 200 MB); Symposia still only accepts files up to this size."
+)
+RESUME_HELP = (
+    f"PDF or plain text. We extract and store up to **{RESUME_TEXT_MAX_CHARS:,} characters** of text for this app "
+    "(not the full binary PDF in the database). Very large PDFs are truncated after extraction."
+)
+
 
 def _resume_text_from_upload(uploaded) -> str:
     if uploaded is None:
@@ -52,9 +66,9 @@ def _resume_text_from_upload(uploaded) -> str:
     name = uploaded.name.lower()
     data = uploaded.read()
     if name.endswith(".pdf"):
-        return extract_text_from_pdf_bytes(data)[:12000]
+        return extract_text_from_pdf_bytes(data)[:RESUME_TEXT_MAX_CHARS]
     try:
-        return data.decode("utf-8", errors="replace")[:12000]
+        return data.decode("utf-8", errors="replace")[:RESUME_TEXT_MAX_CHARS]
     except Exception:
         return ""
 
@@ -308,7 +322,7 @@ def _render_brand_banner(page: str) -> None:
         f"""
         <div class="brand-hero">
             <div class="brand-title">🌿 Symposia 🌿</div>
-            <div class="brand-tag">Making networking easy</div>
+            <div class="brand-tag">Networking made easy</div>
             <p class="brand-sub">{html.escape(sub)}</p>
         </div>
         """,
@@ -372,18 +386,28 @@ def _render_auth():
             with st.expander("Step 2: Profile setup", expanded=True):
                 interests = st.text_area("Interests", key="signup_interests", height=100)
                 linkedin = st.text_input("LinkedIn Profile *optional", key="signup_linkedin")
-                resume = st.file_uploader("Resume *optional", key="signup_resume", type=["pdf", "txt"])
-                pic = st.file_uploader("Profile picture *optional", key="signup_pic", type=["png", "jpg", "jpeg"])
+                resume = st.file_uploader(
+                    "Resume *optional",
+                    key="signup_resume",
+                    type=["pdf", "txt"],
+                    help=RESUME_HELP,
+                )
+                pic = st.file_uploader(
+                    "Profile picture *optional",
+                    key="signup_pic",
+                    type=["png", "jpg", "jpeg"],
+                    help=PROFILE_PIC_HELP,
+                )
                 if resume is not None:
                     st.session_state.signup_resume_text = _resume_text_from_upload(resume)
                 if pic is not None:
                     raw = pic.read()
-                    if len(raw) <= 600_000:
+                    if len(raw) <= PROFILE_PIC_MAX_BYTES:
                         b64s = base64.b64encode(raw).decode("ascii")
                         mime = pic.type or "image/jpeg"
                         st.session_state.signup_pic_b64 = f"data:{mime};base64,{b64s}"
                     else:
-                        st.error("Profile image must be under 600 KB.")
+                        st.error(f"Profile image must be {PROFILE_PIC_MAX_BYTES // 1024} KB or smaller.")
                 ready = st.checkbox("I completed this setup and can edit it later in Your profile.")
                 if st.button("Create account", type="primary", key="signup_btn"):
                     if not interests.strip():
@@ -437,11 +461,12 @@ def _render_profile(user_id: int):
         "Upload a profile picture *optional (JPG or PNG)",
         type=["png", "jpg", "jpeg"],
         key="prof_pic_uploader",
+        help=PROFILE_PIC_HELP,
     )
     if pic is not None:
         raw = pic.read()
-        if len(raw) > 500_000:
-            st.error("Image must be under 500 KB. Try a smaller file.")
+        if len(raw) > PROFILE_PIC_MAX_BYTES:
+            st.error(f"Image must be {PROFILE_PIC_MAX_BYTES // 1024} KB or smaller.")
         else:
             b64s = base64.b64encode(raw).decode("ascii")
             mime = pic.type or "image/jpeg"
@@ -452,10 +477,13 @@ def _render_profile(user_id: int):
         "Resume *optional (PDF or TXT)",
         type=["pdf", "txt"],
         key="prof_resume_file",
+        help=RESUME_HELP,
     )
     if resume_file is not None:
         st.session_state.resume_text = _resume_text_from_upload(resume_file)
-        st.success(f"Resume loaded ({len(st.session_state.resume_text)} characters). Click Save to store.")
+        n = len(st.session_state.resume_text)
+        cap_note = f" (capped at {RESUME_TEXT_MAX_CHARS:,} chars)" if n >= RESUME_TEXT_MAX_CHARS else ""
+        st.success(f"Resume loaded: **{n:,}** characters stored for this app{cap_note}. Click **Save profile** to persist.")
 
     if st.button("Save profile", type="primary", key="prof_save"):
         interests_val = st.session_state.get(
@@ -927,13 +955,20 @@ def _render_contacts(user_id: int) -> None:
             e_li = st.text_input("LinkedIn", value=r.get("linkedin_url", ""), key=f"e_li_{cid}")
             e_topics = st.text_input("Topics", value=r.get("topics", ""), key=f"e_topics_{cid}")
             e_notes = st.text_area("Notes", value=r.get("notes", ""), key=f"e_notes_{cid}", height=80)
-            up = st.file_uploader("Replace business card image (optional)", type=["png", "jpg", "jpeg"], key=f"e_card_{cid}")
+            up = st.file_uploader(
+                "Replace business card image (optional)",
+                type=["png", "jpg", "jpeg"],
+                key=f"e_card_{cid}",
+                help=PROFILE_PIC_HELP,
+            )
             card_b64 = None
             if up is not None:
                 raw = up.read()
-                if len(raw) <= 500_000:
+                if len(raw) <= PROFILE_PIC_MAX_BYTES:
                     mime = up.type or "image/jpeg"
                     card_b64 = f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+                else:
+                    st.error(f"Business card image must be {PROFILE_PIC_MAX_BYTES // 1024} KB or smaller.")
             if st.button("Save contact changes", type="primary", key=f"save_edit_{cid}"):
                 if not e_name.strip():
                     st.error("Name is required.")
@@ -1114,9 +1149,6 @@ def main():
                 st.rerun()
 
     _render_avatar_top_right(username)
-
-    st.title("Symposia")
-    st.caption("Making networking easy")
 
     pg = st.session_state.nav_page
     if pg == NAV_PROFILE:
