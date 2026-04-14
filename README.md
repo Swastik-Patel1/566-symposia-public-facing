@@ -1,4 +1,4 @@
-# Symposia (Conference Scaffolding)
+# Symposia (Conference Scaffolding, Public Facing)
 
 Streamlit web app for undergraduate conference attendees: one local account, multiple conferences, contacts, and lightweight AI-assisted prep. Data stays on the machine that runs the app unless you export it.
 
