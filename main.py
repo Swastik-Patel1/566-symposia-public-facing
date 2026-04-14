@@ -795,8 +795,9 @@ def _render_conference_workspace(user_id: int):
                 speaker=st.session_state.get(f"sess_speaker_{conf_id}") or "(unknown)",
                 description=st.session_state.get(f"sess_desc_{conf_id}") or "(no description)",
             )
-            qs = generate_questions(prompt)
+            qs, q_source = generate_questions(prompt)
             st.session_state[f"last_q_{conf_id}"] = qs
+            st.session_state[f"last_q_source_{conf_id}"] = q_source
             history = _safe_json_list(_row_val(r2, "questions_json", "[]"))
             history.append(
                 {
@@ -812,6 +813,9 @@ def _render_conference_workspace(user_id: int):
 
         last = st.session_state.get(f"last_q_{conf_id}")
         if last:
+            q_src = st.session_state.get(f"last_q_source_{conf_id}")
+            if q_src:
+                st.caption(q_src)
             st.markdown("**You could ask:**")
             st.markdown(f"- {last['q1']}")
             st.markdown(f"- {last['q2']}")
