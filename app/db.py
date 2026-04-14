@@ -16,6 +16,14 @@ def _conn() -> sqlite3.Connection:
     return c
 
 
+def _ensure_user_columns(c: sqlite3.Connection) -> None:
+    cur = c.execute("PRAGMA table_info(users)")
+    names = {row[1] for row in cur.fetchall()}
+    if "profile_image_b64" not in names:
+        # Stores a full data URL (data:image/...;base64,...) for <img src="...">
+        c.execute("ALTER TABLE users ADD COLUMN profile_image_b64 TEXT DEFAULT ''")
+
+
 def init_db() -> None:
     with _conn() as c:
         c.execute(
@@ -27,10 +35,12 @@ def init_db() -> None:
                 interests TEXT DEFAULT '',
                 linkedin TEXT DEFAULT '',
                 resume_text TEXT DEFAULT '',
+                profile_image_b64 TEXT DEFAULT '',
                 created_at TEXT DEFAULT (datetime('now'))
             )
             """
         )
+        _ensure_user_columns(c)
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS conferences (
@@ -78,14 +88,16 @@ def update_user_profile(
     interests: str,
     linkedin: str,
     resume_text: str,
+    profile_image_b64: str = "",
 ) -> None:
     with _conn() as c:
         c.execute(
             """
-            UPDATE users SET interests = ?, linkedin = ?, resume_text = ?
+            UPDATE users SET interests = ?, linkedin = ?, resume_text = ?,
+            profile_image_b64 = ?
             WHERE id = ?
             """,
-            (interests, linkedin, resume_text, user_id),
+            (interests, linkedin, resume_text, profile_image_b64, user_id),
         )
         c.commit()
 
