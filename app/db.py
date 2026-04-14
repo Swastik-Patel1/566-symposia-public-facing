@@ -30,6 +30,7 @@ def _ensure_conference_columns(c: sqlite3.Connection) -> None:
     names = {row[1] for row in cur.fetchall()}
     additions = {
         "event_date": "TEXT DEFAULT ''",
+        "event_end_date": "TEXT DEFAULT ''",
         "reflection_day_notes": "TEXT DEFAULT ''",
         "reflection_contacts": "TEXT DEFAULT ''",
         "reflection_tomorrow": "TEXT DEFAULT ''",
@@ -179,15 +180,22 @@ def get_conference(conf_id: int, user_id: int) -> sqlite3.Row | None:
         return cur.fetchone()
 
 
-def create_conference(user_id: int, name: str, event_date: str) -> int:
+def create_conference(
+    user_id: int, name: str, event_date: str, event_end_date: str = ""
+) -> int:
     with _conn() as c:
         cur = c.execute(
             """
             INSERT INTO conferences (
-                user_id, name, goals, feelings, sessions_json, event_date, questions_json
-            ) VALUES (?, ?, '', 'A little nervous', '[]', ?, '[]')
+                user_id, name, goals, feelings, sessions_json, event_date, event_end_date, questions_json
+            ) VALUES (?, ?, '', 'A little nervous', '[]', ?, ?, '[]')
             """,
-            (user_id, name.strip() or "Untitled conference", event_date.strip()),
+            (
+                user_id,
+                name.strip() or "Untitled conference",
+                event_date.strip(),
+                event_end_date.strip(),
+            ),
         )
         c.commit()
         return int(cur.lastrowid)
@@ -203,6 +211,7 @@ def update_conference(
     sessions: list[dict[str, Any]] | None = None,
     questions: list[dict[str, Any]] | None = None,
     event_date: str | None = None,
+    event_end_date: str | None = None,
     reflection_day_notes: str | None = None,
     reflection_contacts: str | None = None,
     reflection_tomorrow: str | None = None,
@@ -228,6 +237,9 @@ def update_conference(
     if event_date is not None:
         parts.append("event_date = ?")
         vals.append(event_date)
+    if event_end_date is not None:
+        parts.append("event_end_date = ?")
+        vals.append(event_end_date)
     if reflection_day_notes is not None:
         parts.append("reflection_day_notes = ?")
         vals.append(reflection_day_notes)

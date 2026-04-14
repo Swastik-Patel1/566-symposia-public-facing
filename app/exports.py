@@ -144,13 +144,22 @@ def build_reflection_report_md(
     contacts_blob: str,
     tomorrow: str,
     ai_text: str,
+    event_end_date: str = "",
 ) -> str:
+    start = (event_date or "").strip()
+    end = (event_end_date or "").strip()
+    if not start:
+        dates_line = "—"
+    elif not end or end == start:
+        dates_line = start
+    else:
+        dates_line = f"{start} – {end}"
     return "\n".join(
         [
             f"# Reflection — {conference_name}",
             "",
             f"- **Account:** {username}",
-            f"- **Conference date:** {event_date or '—'}",
+            f"- **Conference dates:** {dates_line}",
             "",
             "## Today",
             day_notes or "—",

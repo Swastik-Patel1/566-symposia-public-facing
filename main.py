@@ -19,6 +19,7 @@ from app.db import (
     delete_user,
     export_user_data,
     get_conference,
+    get_contact,
     get_user_by_id,
     get_user_by_username,
     init_db,
@@ -50,12 +51,13 @@ NAV_PRIVACY = "Privacy"
 PROFILE_PIC_MAX_BYTES = 500 * 1024  # 500 KiB — max size we accept for profile photos
 RESUME_TEXT_MAX_CHARS = 12_000  # extracted text kept for storage / AI prompts
 
-PROFILE_PIC_HELP = (
-    f"Profile picture must be **{PROFILE_PIC_MAX_BYTES // 1024} KB** or smaller. "
-    "The widget may show a much larger browser upload limit (e.g. 200 MB); Symposia still only accepts files up to this size."
+PROFILE_PIC_LIMIT_TEXT = (
+    f"Profile picture must be {PROFILE_PIC_MAX_BYTES // 1024} KB or smaller. "
+    "The widget may show a much larger browser upload limit (e.g. 200 MB); Symposia still only accepts files up to this size. "
+    "Accepted file types: PNG, JPG, JPEG."
 )
-RESUME_HELP = (
-    f"PDF or plain text. We extract and store up to **{RESUME_TEXT_MAX_CHARS:,} characters** of text for this app "
+RESUME_LIMIT_TEXT = (
+    f"PDF or plain text. We extract and store up to {RESUME_TEXT_MAX_CHARS:,} characters of text for this app "
     "(not the full binary PDF in the database). Very large PDFs are truncated after extraction."
 )
 
@@ -223,6 +225,12 @@ def _apply_theme():
             font-size: 0.9rem;
         }
         [data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
+        /* Hide Streamlit default "200MB per file • …" line; we show Symposia limits in captions instead */
+        [data-testid="stFileUploaderDropzoneInstructions"],
+        [data-testid="stFileUploader"] section small,
+        [data-testid="stFileUploader"] small {
+            display: none !important;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -348,6 +356,17 @@ def _parse_mdy(s: str) -> date:
     return date.today()
 
 
+def _conf_dates_caption(start_s: str, end_s: str) -> str:
+    """Human-readable stored MM-DD-YYYY (or legacy) range for UI copy."""
+    start_s = (start_s or "").strip()
+    end_s = (end_s or "").strip()
+    if not start_s:
+        return "set dates in My conferences → Prep"
+    if not end_s or end_s == start_s:
+        return start_s
+    return f"{start_s} – {end_s}"
+
+
 def _render_auth():
     _render_brand_banner("auth")
     tab_login, tab_signup = st.tabs(["Log in", "Sign up"])
@@ -390,14 +409,14 @@ def _render_auth():
                     "Resume *optional",
                     key="signup_resume",
                     type=["pdf", "txt"],
-                    help=RESUME_HELP,
                 )
+                st.caption(RESUME_LIMIT_TEXT)
                 pic = st.file_uploader(
                     "Profile picture *optional",
                     key="signup_pic",
                     type=["png", "jpg", "jpeg"],
-                    help=PROFILE_PIC_HELP,
                 )
+                st.caption(PROFILE_PIC_LIMIT_TEXT)
                 if resume is not None:
                     st.session_state.signup_resume_text = _resume_text_from_upload(resume)
                 if pic is not None:
@@ -461,8 +480,8 @@ def _render_profile(user_id: int):
         "Upload a profile picture *optional (JPG or PNG)",
         type=["png", "jpg", "jpeg"],
         key="prof_pic_uploader",
-        help=PROFILE_PIC_HELP,
     )
+    st.caption(PROFILE_PIC_LIMIT_TEXT)
     if pic is not None:
         raw = pic.read()
         if len(raw) > PROFILE_PIC_MAX_BYTES:
@@ -477,8 +496,8 @@ def _render_profile(user_id: int):
         "Resume *optional (PDF or TXT)",
         type=["pdf", "txt"],
         key="prof_resume_file",
-        help=RESUME_HELP,
     )
+    st.caption(RESUME_LIMIT_TEXT)
     if resume_file is not None:
         st.session_state.resume_text = _resume_text_from_upload(resume_file)
         n = len(st.session_state.resume_text)
@@ -539,22 +558,79 @@ def _render_conference_workspace(user_id: int):
         "Upload the event program PDF in Prep, then click Save buttons after autofill actions so data persists."
     )
 
+    pdel = st.session_state.get("conference_delete_pending")
+    if pdel is not None:
+        cid_pending = int(pdel)
+        crow = get_conference(cid_pending, user_id)
+        if crow is None:
+            st.session_state.pop("conference_delete_pending", None)
+        else:
+            cnm = (crow["name"] or "").strip() or f"Conference #{cid_pending}"
+            st.warning(
+                f'Are you sure you want to delete **"{cnm}"**? This removes its schedule, reflections, '
+                "and saved session questions from Symposia. Contacts linked only to this conference will lose that link. "
+                "This cannot be undone."
+            )
+            c_yes, c_no = st.columns(2)
+            with c_yes:
+                if st.button("Yes, delete conference", type="primary", key="conference_delete_confirm_yes"):
+                    delete_conference(cid_pending, user_id)
+                    if st.session_state.get("sel_conf") == cid_pending:
+                        st.session_state.pop("sel_conf", None)
+                    st.session_state.pop("conference_delete_pending", None)
+                    st.rerun()
+            with c_no:
+                if st.button("Cancel", key="conference_delete_confirm_no"):
+                    st.session_state.pop("conference_delete_pending", None)
+                    st.rerun()
+            st.stop()
+
     rows = list_conferences(user_id)
 
-    with st.expander("➕ Add a conference", expanded=not rows):
-        nn = st.text_input("Conference name", key="new_conf_name", placeholder="e.g. ACM CHI 2026")
-        nd = st.date_input(
-            "Conference date",
-            key="new_conf_date",
-            value=date.today(),
-            help="Required; used for calendar sorting and .ics export.",
+    if "add_conf_expander_expanded" not in st.session_state:
+        st.session_state.add_conf_expander_expanded = not rows
+    elif not rows:
+        st.session_state.add_conf_expander_expanded = True
+
+    if "add_conf_form_id" not in st.session_state:
+        st.session_state.add_conf_form_id = 0
+    _acf = int(st.session_state.add_conf_form_id)
+
+    with st.expander("➕ Add a conference", expanded=st.session_state.add_conf_expander_expanded):
+        nn = st.text_input(
+            "Conference name",
+            key=f"new_conf_name_{_acf}",
+            placeholder="e.g. ACM CHI 2026",
         )
-        if st.button("Create conference", key="new_conf_btn"):
+        nd_start = st.date_input(
+            "Conference start date",
+            key=f"new_conf_date_start_{_acf}",
+            value=date.today(),
+            help="Used for sorting, labels, and as the default day when building .ics events from your schedule.",
+        )
+        nd_end = st.date_input(
+            "Conference end date",
+            key=f"new_conf_date_end_{_acf}",
+            value=nd_start,
+            min_value=nd_start,
+            help="Last day of the symposium or multi-day event (can match the start date for a one-day event).",
+        )
+        if st.button("Create conference", key=f"new_conf_btn_{_acf}"):
             if not nn.strip():
                 st.error("Enter a name.")
             else:
-                cid = create_conference(user_id, nn.strip(), event_date=_fmt_mdy(nd))
+                cid = create_conference(
+                    user_id,
+                    nn.strip(),
+                    event_date=_fmt_mdy(nd_start),
+                    event_end_date=_fmt_mdy(nd_end),
+                )
                 st.session_state.sel_conf = cid
+                st.session_state.add_conf_expander_expanded = False
+                for _base in ("new_conf_name", "new_conf_date_start", "new_conf_date_end"):
+                    st.session_state.pop(f"{_base}_{_acf}", None)
+                st.session_state.pop(f"new_conf_btn_{_acf}", None)
+                st.session_state.add_conf_form_id = _acf + 1
                 st.rerun()
 
     if not rows:
@@ -580,8 +656,7 @@ def _render_conference_workspace(user_id: int):
         return
 
     if st.button("Delete this conference", key=f"del_conf_{conf_id}"):
-        delete_conference(conf_id, user_id)
-        st.session_state.pop("sel_conf", None)
+        st.session_state.conference_delete_pending = conf_id
         st.rerun()
 
     sub_prep, sub_during, sub_after = st.tabs(["Prep & schedule", "Session coach", "End of day"])
@@ -594,10 +669,19 @@ def _render_conference_workspace(user_id: int):
             key=f"cname_{conf_id}",
         )
         cdate = st.date_input(
-            "Conference Date",
+            "Conference start date",
             value=_parse_mdy(_row_val(row, "event_date")),
             key=f"edate_{conf_id}",
-            help="Required. Use the calendar pop-up to select a day.",
+            help="First day of the conference or symposium.",
+        )
+        end_raw = _row_val(row, "event_end_date")
+        c_end_default = _parse_mdy(end_raw) if end_raw.strip() else _parse_mdy(_row_val(row, "event_date"))
+        c_end = st.date_input(
+            "Conference end date",
+            value=max(cdate, c_end_default),
+            min_value=cdate,
+            key=f"eendate_{conf_id}",
+            help="Last day of the event (same as start for a single-day conference).",
         )
         cgoals = st.text_area(
             "Goals for this conference",
@@ -618,6 +702,9 @@ def _render_conference_workspace(user_id: int):
             "Schedule PDF (upload the event program PDF for this conference)",
             type=["pdf"],
             key=f"cpdf_{conf_id}",
+        )
+        st.caption(
+            "PDF only. The uploader may show a large max file size; Symposia only uses the PDF you choose here."
         )
         if up is not None:
             raw = extract_text_from_pdf_bytes(up.read())
@@ -648,6 +735,7 @@ def _render_conference_workspace(user_id: int):
                 goals=cgoals,
                 feelings=cfeel,
                 event_date=_fmt_mdy(cdate),
+                event_end_date=_fmt_mdy(max(cdate, c_end)),
                 sessions=sessions_edited,
             )
             st.success("Saved.")
@@ -797,6 +885,7 @@ def _render_conference_workspace(user_id: int):
             uname = u["username"] if u else "user"
             cnm = _row_val(r_ref, "name") or labels[conf_id]
             ed = _row_val(r_ref, "event_date")
+            eed = _row_val(r_ref, "event_end_date")
             md = build_reflection_report_md(
                 uname,
                 cnm,
@@ -805,6 +894,7 @@ def _render_conference_workspace(user_id: int):
                 st.session_state.get(f"day_contacts_{conf_id}") or "",
                 st.session_state.get(f"day_tomorrow_{conf_id}") or "",
                 out,
+                event_end_date=eed,
             )
             st.download_button(
                 "Download reflection (.md)",
@@ -827,6 +917,27 @@ def _render_conference_workspace(user_id: int):
 
 def _render_contacts(user_id: int) -> None:
     _render_brand_banner(NAV_CONTACTS)
+
+    pdel = st.session_state.get("contact_delete_pending")
+    if pdel is not None:
+        crow = get_contact(int(pdel), user_id)
+        if crow is None:
+            st.session_state.pop("contact_delete_pending", None)
+        else:
+            dnm = (crow["name"] or "").strip() or "this contact"
+            st.warning(f'Are you sure you want to delete **"{dnm}"**? This cannot be undone.')
+            c_yes, c_no = st.columns(2)
+            with c_yes:
+                if st.button("Yes, delete contact", type="primary", key="contact_delete_confirm_yes"):
+                    delete_contact(int(pdel), user_id)
+                    st.session_state.pop("contact_delete_pending", None)
+                    st.rerun()
+            with c_no:
+                if st.button("Cancel", key="contact_delete_confirm_no"):
+                    st.session_state.pop("contact_delete_pending", None)
+                    st.rerun()
+            st.stop()
+
     confs = list_conferences(user_id)
     cmap: dict[int, str] = {int(c["id"]): (c["name"] or f"#{c['id']}") for c in confs}
     cmap[0] = "(No conference)"
@@ -853,6 +964,7 @@ def _render_contacts(user_id: int) -> None:
             type=["png", "jpg", "jpeg"],
             key="add_contact_card",
         )
+        st.caption(PROFILE_PIC_LIMIT_TEXT)
         if card is not None:
             raw = card.read()
             st.session_state["new_card_raw"] = raw
@@ -936,7 +1048,7 @@ def _render_contacts(user_id: int) -> None:
                 st.rerun()
         with c3:
             if st.button("Delete", key=f"delcon_{cid}"):
-                delete_contact(cid, user_id)
+                st.session_state.contact_delete_pending = cid
                 st.rerun()
 
         if st.session_state.get(edit_key, False):
@@ -959,8 +1071,8 @@ def _render_contacts(user_id: int) -> None:
                 "Replace business card image (optional)",
                 type=["png", "jpg", "jpeg"],
                 key=f"e_card_{cid}",
-                help=PROFILE_PIC_HELP,
             )
+            st.caption(PROFILE_PIC_LIMIT_TEXT)
             card_b64 = None
             if up is not None:
                 raw = up.read()
@@ -1006,7 +1118,8 @@ def _render_calendar_exports(user_id: int) -> None:
             cid = int(c["id"])
             nm = c["name"] or f"Conference #{cid}"
             ed = _row_val(c, "event_date")
-            st.markdown(f"**{nm}** — _{ed or 'set date in My conferences → Prep'}_")
+            eed = _row_val(c, "event_end_date")
+            st.markdown(f"**{nm}** — _{_conf_dates_caption(ed, eed)}_")
             sess: list = []
             try:
                 sess = json.loads(c["sessions_json"] or "[]")
@@ -1151,6 +1264,11 @@ def main():
     _render_avatar_top_right(username)
 
     pg = st.session_state.nav_page
+    if pg != NAV_CONTACTS:
+        st.session_state.pop("contact_delete_pending", None)
+    if pg != NAV_CONFERENCES:
+        st.session_state.pop("conference_delete_pending", None)
+
     if pg == NAV_PROFILE:
         _render_profile(user_id)
     elif pg == NAV_CONFERENCES:
