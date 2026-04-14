@@ -4,25 +4,44 @@ import base64
 import html
 import json
 import sqlite3
+from datetime import date
 
 import streamlit as st
 
 from app.auth import hash_password, verify_password
 from app.db import (
+    add_contact,
     create_conference,
     create_user,
     delete_conference,
+    delete_contact,
+    delete_user,
+    export_user_data,
     get_conference,
     get_user_by_id,
     get_user_by_username,
     init_db,
     list_conferences,
+    list_contacts,
+    list_contacts_for_conference,
+    row_to_dict,
     update_conference,
     update_user_profile,
+)
+from app.exports import (
+    build_conference_ics,
+    build_reflection_report_md,
+    contacts_to_csv,
 )
 from app.llm import generate_questions, generate_reflection
 from app.parser import extract_text_from_pdf_bytes, naive_session_parse
 from app.prompts import QUESTION_PROMPT, REFLECTION_PROMPT
+
+NAV_PROFILE = "Your profile"
+NAV_CONFERENCES = "My conferences"
+NAV_CONTACTS = "Contacts"
+NAV_CALENDAR = "Calendar & exports"
+NAV_PRIVACY = "Privacy & data"
 
 
 def _resume_text_from_upload(uploaded) -> str:
@@ -82,11 +101,17 @@ def _apply_theme():
         [data-testid="stSidebar"] p, [data-testid="stSidebar"] span, [data-testid="stSidebar"] label {
             color: #e2e8f0 !important;
         }
-        [data-testid="stSidebar"] .stButton > button[kind="primary"] {
+        [data-testid="stSidebar"] .stButton > button[kind="primary"],
+        [data-testid="stSidebar"] .stButton > button[kind="primary"] * {
             background-color: #ffffff !important;
             color: #020617 !important;
             border: none !important;
             font-weight: 600 !important;
+        }
+        [data-testid="stSidebar"] .stButton > button[kind="primary"] p,
+        [data-testid="stSidebar"] .stButton > button[kind="primary"] span {
+            color: #020617 !important;
+            background: transparent !important;
         }
         [data-testid="stSidebar"] .stButton > button[kind="secondary"] {
             background-color: #1e293b !important;
@@ -123,6 +148,15 @@ def _apply_theme():
             display: flex;
             align-items: center;
             justify-content: center;
+        }
+        .cs-avatar-wrap a {
+            text-decoration: none;
+            line-height: 0;
+        }
+        .cs-avatar-wrap a:focus {
+            outline: 2px solid #38bdf8;
+            outline-offset: 2px;
+            border-radius: 50%;
         }
         .cs-avatar, .cs-avatar-placeholder {
             width: 56px;
@@ -188,9 +222,34 @@ def _render_avatar_top_right(username: str) -> None:
     else:
         inner = f'<div class="cs-avatar-placeholder">{html.escape(initial)}</div>'
     st.markdown(
-        f'<div class="cs-avatar-wrap">{inner}</div>',
+        f'<div class="cs-avatar-wrap">'
+        f'<a href="?nav=profile" title="Go to Your profile">{inner}</a>'
+        f"</div>",
         unsafe_allow_html=True,
     )
+
+
+def _consume_nav_query_param() -> None:
+    try:
+        nav = st.query_params.get("nav")
+        if isinstance(nav, list):
+            nav = nav[0] if nav else None
+        if nav == "profile":
+            st.session_state.nav_page = NAV_PROFILE
+            del st.query_params["nav"]
+    except Exception:
+        pass
+
+
+def _row_val(row, key: str, default: str = "") -> str:
+    if row is None:
+        return default
+    try:
+        if key in row.keys():
+            return row[key] or default
+    except Exception:
+        pass
+    return default
 
 
 def _render_auth():
@@ -344,11 +403,24 @@ def _render_conference_workspace(user_id: int):
 
     with st.expander("➕ Add a conference", expanded=not rows):
         nn = st.text_input("Conference name", key="new_conf_name", placeholder="e.g. ACM CHI 2026")
+        nd = st.text_input(
+            "Conference date (YYYY-MM-DD), optional",
+            key="new_conf_date",
+            placeholder="2026-06-15",
+            help="Used for calendar sorting and .ics export.",
+        )
         if st.button("Create conference", key="new_conf_btn"):
             if not nn.strip():
                 st.error("Enter a name.")
             else:
-                cid = create_conference(user_id, nn.strip())
+                dpart = nd.strip()[:10] if nd.strip() else ""
+                if dpart:
+                    try:
+                        date.fromisoformat(dpart)
+                    except ValueError:
+                        st.error("Date must be YYYY-MM-DD (e.g. 2026-06-15).")
+                        return
+                cid = create_conference(user_id, nn.strip(), event_date=dpart)
                 st.session_state.sel_conf = cid
                 st.rerun()
 
@@ -388,6 +460,13 @@ def _render_conference_workspace(user_id: int):
             value=row["name"] or "",
             key=f"cname_{conf_id}",
         )
+        edate_val = _row_val(row, "event_date")
+        cdate_str = st.text_input(
+            "Conference date (YYYY-MM-DD), optional",
+            value=edate_val,
+            key=f"edate_{conf_id}",
+            help="Shown on the Calendar page and used when exporting your schedule to .ics.",
+        )
         cgoals = st.text_area(
             "Goals for this conference",
             value=row["goals"] or "",
@@ -416,12 +495,20 @@ def _render_conference_workspace(user_id: int):
 
         sessions = _sessions_from_row(get_conference(conf_id, user_id) or row)
         if st.button("Save conference details", type="primary", key=f"csave_{conf_id}"):
+            dpart = (cdate_str or "").strip()[:10]
+            if dpart:
+                try:
+                    date.fromisoformat(dpart)
+                except ValueError:
+                    st.error("Date must be YYYY-MM-DD or leave blank.")
+                    return
             update_conference(
                 conf_id,
                 user_id,
                 name=cname,
                 goals=cgoals,
                 feelings=cfeel,
+                event_date=dpart,
             )
             st.success("Saved.")
 
@@ -495,6 +582,20 @@ def _render_conference_workspace(user_id: int):
             st.markdown(f"- {last['q3']}")
 
     with sub_after:
+        r_ref = get_conference(conf_id, user_id) or row
+        dn0 = _row_val(r_ref, "reflection_day_notes")
+        dc0 = _row_val(r_ref, "reflection_contacts")
+        dt0 = _row_val(r_ref, "reflection_tomorrow")
+        dai0 = _row_val(r_ref, "reflection_ai")
+        if f"day_notes_{conf_id}" not in st.session_state:
+            st.session_state[f"day_notes_{conf_id}"] = dn0
+        if f"day_contacts_{conf_id}" not in st.session_state:
+            st.session_state[f"day_contacts_{conf_id}"] = dc0
+        if f"day_tomorrow_{conf_id}" not in st.session_state:
+            st.session_state[f"day_tomorrow_{conf_id}"] = dt0
+        if f"refl_out_{conf_id}" not in st.session_state and dai0:
+            st.session_state[f"refl_out_{conf_id}"] = dai0
+
         st.text_area(
             "What happened today?",
             height=100,
@@ -510,18 +611,246 @@ def _render_conference_workspace(user_id: int):
             height=60,
             key=f"day_tomorrow_{conf_id}",
         )
-        if st.button("Synthesize my day", type="primary", key=f"refl_{conf_id}"):
-            prompt = REFLECTION_PROMPT.format(
-                notes=st.session_state.get(f"day_notes_{conf_id}") or "(nothing yet)",
-                contacts=st.session_state.get(f"day_contacts_{conf_id}") or "(none noted)",
-                tomorrow_sessions=st.session_state.get(f"day_tomorrow_{conf_id}")
-                or "(not specified)",
-            )
-            st.session_state[f"refl_out_{conf_id}"] = generate_reflection(prompt)
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("Save reflection notes", key=f"rsave_{conf_id}"):
+                update_conference(
+                    conf_id,
+                    user_id,
+                    reflection_day_notes=st.session_state.get(f"day_notes_{conf_id}") or "",
+                    reflection_contacts=st.session_state.get(f"day_contacts_{conf_id}") or "",
+                    reflection_tomorrow=st.session_state.get(f"day_tomorrow_{conf_id}") or "",
+                    reflection_ai=st.session_state.get(f"refl_out_{conf_id}") or "",
+                )
+                st.success("Reflection saved.")
+        with b2:
+            if st.button("Synthesize my day (AI)", type="primary", key=f"refl_{conf_id}"):
+                prompt = REFLECTION_PROMPT.format(
+                    notes=st.session_state.get(f"day_notes_{conf_id}") or "(nothing yet)",
+                    contacts=st.session_state.get(f"day_contacts_{conf_id}") or "(none noted)",
+                    tomorrow_sessions=st.session_state.get(f"day_tomorrow_{conf_id}")
+                    or "(not specified)",
+                )
+                out = generate_reflection(prompt)
+                st.session_state[f"refl_out_{conf_id}"] = out
+                update_conference(
+                    conf_id,
+                    user_id,
+                    reflection_day_notes=st.session_state.get(f"day_notes_{conf_id}") or "",
+                    reflection_contacts=st.session_state.get(f"day_contacts_{conf_id}") or "",
+                    reflection_tomorrow=st.session_state.get(f"day_tomorrow_{conf_id}") or "",
+                    reflection_ai=out,
+                )
 
         out = st.session_state.get(f"refl_out_{conf_id}")
         if out:
             st.markdown(out)
+            u = get_user_by_id(user_id)
+            uname = u["username"] if u else "user"
+            cnm = _row_val(r_ref, "name") or labels[conf_id]
+            ed = _row_val(r_ref, "event_date")
+            md = build_reflection_report_md(
+                uname,
+                cnm,
+                ed,
+                st.session_state.get(f"day_notes_{conf_id}") or "",
+                st.session_state.get(f"day_contacts_{conf_id}") or "",
+                st.session_state.get(f"day_tomorrow_{conf_id}") or "",
+                out,
+            )
+            st.download_button(
+                "Download reflection (.md)",
+                md,
+                file_name=f"reflection_{conf_id}.md",
+                mime="text/markdown",
+                key=f"dl_refl_{conf_id}",
+            )
+
+
+def _render_contacts(user_id: int) -> None:
+    st.header("Contacts")
+    st.write(
+        "Track people you meet. Tie each contact to a conference when it helps you remember context. "
+        "Export CSVs from **Calendar & exports**."
+    )
+    confs = list_conferences(user_id)
+    cmap: dict[int, str] = {int(c["id"]): (c["name"] or f"#{c['id']}") for c in confs}
+    cmap[0] = "(No conference)"
+
+    conf_options = [0] + [int(c["id"]) for c in confs]
+    with st.expander("Add a contact", expanded=True):
+        cid_pick = st.selectbox(
+            "Conference",
+            options=conf_options,
+            format_func=lambda i: cmap.get(i, "?"),
+            key="add_contact_conf",
+        )
+        cn = st.text_input("Name *", key="add_contact_name")
+        co = st.text_input("Organization", key="add_contact_org")
+        ce = st.text_input("Email", key="add_contact_email")
+        cl = st.text_input("LinkedIn URL", key="add_contact_li")
+        ct = st.text_input("Topics / how you met", key="add_contact_topics")
+        cnotes = st.text_area("Notes", key="add_contact_notes", height=80)
+        card = st.file_uploader(
+            "Business card (image)", type=["png", "jpg", "jpeg"], key="add_contact_card"
+        )
+        card_b64 = ""
+        if card is not None:
+            raw = card.read()
+            if len(raw) > 400_000:
+                st.error("Image too large (max ~400 KB).")
+            else:
+                mime = card.type or "image/jpeg"
+                card_b64 = (
+                    f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+                )
+        if st.button("Save contact", key="add_contact_btn"):
+            if not cn.strip():
+                st.error("Name is required.")
+            else:
+                add_contact(
+                    user_id,
+                    None if cid_pick == 0 else int(cid_pick),
+                    cn.strip(),
+                    org=co,
+                    email=ce,
+                    linkedin_url=cl,
+                    topics=ct,
+                    notes=cnotes,
+                    business_card_b64=card_b64,
+                )
+                st.success("Contact saved.")
+                st.rerun()
+
+    rows = list_contacts(user_id)
+    if not rows:
+        st.info("No contacts yet.")
+        return
+
+    for r in rows:
+        ccid = r["conference_id"]
+        if ccid is not None:
+            clabel = cmap.get(int(ccid), f"Conference {ccid}")
+        else:
+            clabel = "(No conference)"
+        with st.container():
+            st.markdown(f"**{r['name']}** — _{clabel}_")
+            cols = st.columns([4, 1])
+            with cols[0]:
+                if r["org"]:
+                    st.caption(r["org"])
+                if r["email"]:
+                    st.caption(r["email"])
+                if r["linkedin_url"]:
+                    st.caption(r["linkedin_url"])
+                if r["topics"]:
+                    st.caption(r["topics"])
+                if r["notes"]:
+                    st.text(str(r["notes"])[:500])
+            with cols[1]:
+                if st.button("Delete", key=f"delcon_{r['id']}"):
+                    delete_contact(int(r["id"]), user_id)
+                    st.rerun()
+            st.divider()
+
+
+def _render_calendar_exports(user_id: int) -> None:
+    st.header("Calendar & exports")
+    st.write(
+        "Download an **.ics** calendar for each conference (from its saved schedule). "
+        "Export **contacts** as CSV — all contacts, or per conference when applicable."
+    )
+
+    confs = list_conferences(user_id)
+    if confs:
+        st.subheader("Conference schedules (.ics)")
+        for c in confs:
+            cid = int(c["id"])
+            nm = c["name"] or f"Conference #{cid}"
+            ed = _row_val(c, "event_date")
+            st.markdown(f"**{nm}** — _{ed or 'set date in My conferences → Prep'}_")
+            sess: list = []
+            try:
+                sess = json.loads(c["sessions_json"] or "[]")
+            except json.JSONDecodeError:
+                sess = []
+            if not sess:
+                st.caption("Upload and parse a schedule PDF under **My conferences** first.")
+            ics = build_conference_ics(nm, ed, sess)
+            st.download_button(
+                f"Download .ics — {nm}",
+                ics,
+                file_name=f"conference_{cid}.ics",
+                mime="text/calendar",
+                key=f"ics_{cid}",
+            )
+
+
+    st.subheader("Contacts (CSV)")
+    contacts_list = [row_to_dict(r) for r in list_contacts(user_id)]
+    st.download_button(
+        "Download all contacts (.csv)",
+        contacts_to_csv(contacts_list),
+        file_name="contacts.csv",
+        mime="text/csv",
+        key="dl_csv_all",
+    )
+
+    if confs:
+        st.subheader("Per-conference contacts (CSV)")
+        for c in confs:
+            cid = int(c["id"])
+            rows_c = [
+                row_to_dict(r)
+                for r in list_contacts_for_conference(user_id, cid)
+            ]
+            if not rows_c:
+                continue
+            nm = c["name"] or f"Conference #{cid}"
+            st.download_button(
+                f"CSV — {nm}",
+                contacts_to_csv(rows_c),
+                file_name=f"contacts_conference_{cid}.csv",
+                mime="text/csv",
+                key=f"csv_cc_{cid}",
+            )
+
+
+def _render_privacy(user_id: int, username: str) -> None:
+    st.header("Privacy & data")
+    with st.expander("How your data is handled", expanded=False):
+        st.markdown(
+            """
+- Data is stored in a **local SQLite** file (`data/app.db`) on the machine running Streamlit.
+- **Passwords** are hashed (PBKDF2). Do not reuse an important password for this demo.
+- **Resumes, reflections, contacts, and photos** are sensitive. Do not expose this app or the database on the public internet without proper security review, HTTPS, and hosting policies.
+- Use **Export** below for a portable JSON copy. **Delete account** removes your user row and related conferences and contacts in this database.
+            """
+        )
+    bundle = export_user_data(user_id)
+    st.subheader("Export a copy of your data")
+    st.download_button(
+        "Download my data (.json)",
+        json.dumps(bundle, indent=2, default=str),
+        file_name=f"conference_scaffolding_export_{user_id}.json",
+        mime="application/json",
+        key="dl_json_privacy",
+    )
+    st.subheader("Delete account")
+    st.warning(
+        "Permanently deletes your profile, conferences, contacts, and saved reflections."
+    )
+    confirm = st.text_input(
+        f"Type your username (`{username}`) to confirm deletion",
+        key="del_account_confirm",
+    )
+    if st.button("Delete my account permanently", type="primary", key="del_account_btn"):
+        if confirm.strip().lower() == username.lower():
+            delete_user(user_id)
+            st.success("Account deleted.")
+            _logout()
+        else:
+            st.error("Username does not match — nothing was deleted.")
 
 
 def main():
@@ -541,8 +870,21 @@ def main():
     username = st.session_state.get("auth_username", "user")
     _seed_profile_from_db(user_id)
 
+    if st.session_state.get("nav_page") == "My profile":
+        st.session_state.nav_page = NAV_PROFILE
+
     if "nav_page" not in st.session_state:
-        st.session_state.nav_page = "My profile"
+        st.session_state.nav_page = NAV_PROFILE
+
+    _consume_nav_query_param()
+
+    nav_labels = [
+        NAV_PROFILE,
+        NAV_CONFERENCES,
+        NAV_CONTACTS,
+        NAV_CALENDAR,
+        NAV_PRIVACY,
+    ]
 
     with st.sidebar:
         st.markdown("### Account")
@@ -551,23 +893,15 @@ def main():
             _logout()
         st.divider()
         st.markdown("**Pages**")
-        nav = st.session_state.nav_page
-        if st.button(
-            "My profile",
-            key="nav_btn_profile",
-            use_container_width=True,
-            type="primary" if nav == "My profile" else "secondary",
-        ):
-            st.session_state.nav_page = "My profile"
-            st.rerun()
-        if st.button(
-            "My conferences",
-            key="nav_btn_conf",
-            use_container_width=True,
-            type="primary" if nav == "My conferences" else "secondary",
-        ):
-            st.session_state.nav_page = "My conferences"
-            st.rerun()
+        for i, label in enumerate(nav_labels):
+            if st.button(
+                label,
+                key=f"sidebar_nav_{i}",
+                use_container_width=True,
+                type="primary" if st.session_state.nav_page == label else "secondary",
+            ):
+                st.session_state.nav_page = label
+                st.rerun()
 
     _render_avatar_top_right(username)
 
@@ -577,10 +911,17 @@ def main():
         "saved profile and one workspace per conference."
     )
 
-    if st.session_state.nav_page == "My profile":
+    pg = st.session_state.nav_page
+    if pg == NAV_PROFILE:
         _render_profile(user_id)
-    else:
+    elif pg == NAV_CONFERENCES:
         _render_conference_workspace(user_id)
+    elif pg == NAV_CONTACTS:
+        _render_contacts(user_id)
+    elif pg == NAV_CALENDAR:
+        _render_calendar_exports(user_id)
+    elif pg == NAV_PRIVACY:
+        _render_privacy(user_id, username)
 
     st.divider()
     st.caption(
