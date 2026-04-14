@@ -270,16 +270,62 @@ def _profile_image_url() -> str:
 
 def _render_avatar_top_right(username: str) -> None:
     url = _profile_image_url()
-    initial = (username[:1] or "?").upper()
+    initial = html.escape((username[:1] or "?").upper())
+    bg_rules = ""
     if url:
-        inner = f'<img class="cs-avatar" src="{html.escape(url)}" alt="Profile photo" />'
+        bg_rules = (
+            f"background-image: url({json.dumps(url)}) !important;"
+            "background-size: cover !important;"
+            "background-position: center !important;"
+        )
+
+    if url:
+        label_rules = "opacity: 0 !important; font-size: 0 !important; line-height: 0 !important;"
     else:
-        inner = f'<div class="cs-avatar-placeholder">{html.escape(initial)}</div>'
+        label_rules = (
+            "opacity: 1 !important; color: #f8fafc !important; font-size: 1.25rem !important;"
+            "font-weight: 700 !important; line-height: 1.2 !important; margin: 0 !important;"
+        )
+
     st.markdown(
-        f'<div class="cs-avatar-wrap">'
-        f'<a href="?nav=profile" title="Go to Your profile">{inner}</a>'
-        f"</div>",
+        f"""
+        <style>
+        .st-key-symposia_profile_nav_btn {{
+            position: fixed !important;
+            top: 0.85rem !important;
+            right: 1rem !important;
+            z-index: 1000000 !important;
+            width: 56px !important;
+            height: 56px !important;
+        }}
+        .st-key-symposia_profile_nav_btn button {{
+            width: 56px !important;
+            height: 56px !important;
+            min-height: unset !important;
+            border-radius: 50% !important;
+            overflow: hidden !important;
+            border: 3px solid #e2e8f0 !important;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.45) !important;
+            background-color: #334155 !important;
+            padding: 0 !important;
+            {bg_rules}
+        }}
+        .st-key-symposia_profile_nav_btn button p {{
+            {label_rules}
+        }}
+        </style>
+        """,
         unsafe_allow_html=True,
+    )
+
+    def _go_to_profile() -> None:
+        st.session_state.nav_page = NAV_PROFILE
+
+    st.button(
+        "\u00a0" if url else initial,
+        key="symposia_profile_nav_btn",
+        help="Go to Your profile",
+        on_click=_go_to_profile,
     )
 
 
