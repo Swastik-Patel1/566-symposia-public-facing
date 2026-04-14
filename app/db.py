@@ -1,5 +1,7 @@
 """SQLite persistence for users, conferences, and contacts."""
 
+from __future__ import annotations
+
 import json
 import sqlite3
 from pathlib import Path
@@ -20,24 +22,23 @@ def _ensure_user_columns(c: sqlite3.Connection) -> None:
     cur = c.execute("PRAGMA table_info(users)")
     names = {row[1] for row in cur.fetchall()}
     if "profile_image_b64" not in names:
-        c.execute(
-            "ALTER TABLE users ADD COLUMN profile_image_b64 TEXT DEFAULT ''"
-        )
+        c.execute("ALTER TABLE users ADD COLUMN profile_image_b64 TEXT DEFAULT ''")
 
 
 def _ensure_conference_columns(c: sqlite3.Connection) -> None:
     cur = c.execute("PRAGMA table_info(conferences)")
     names = {row[1] for row in cur.fetchall()}
-    if "event_date" not in names:
-        c.execute("ALTER TABLE conferences ADD COLUMN event_date TEXT DEFAULT ''")
-    for col in (
-        "reflection_day_notes",
-        "reflection_contacts",
-        "reflection_tomorrow",
-        "reflection_ai",
-    ):
+    additions = {
+        "event_date": "TEXT DEFAULT ''",
+        "reflection_day_notes": "TEXT DEFAULT ''",
+        "reflection_contacts": "TEXT DEFAULT ''",
+        "reflection_tomorrow": "TEXT DEFAULT ''",
+        "reflection_ai": "TEXT DEFAULT ''",
+        "questions_json": "TEXT DEFAULT '[]'",
+    }
+    for col, spec in additions.items():
         if col not in names:
-            c.execute(f"ALTER TABLE conferences ADD COLUMN {col} TEXT DEFAULT ''")
+            c.execute(f"ALTER TABLE conferences ADD COLUMN {col} {spec}")
 
 
 def _ensure_contacts_table(c: sqlite3.Connection) -> None:
@@ -91,6 +92,7 @@ def init_db() -> None:
                 reflection_contacts TEXT DEFAULT '',
                 reflection_tomorrow TEXT DEFAULT '',
                 reflection_ai TEXT DEFAULT '',
+                questions_json TEXT DEFAULT '[]',
                 created_at TEXT DEFAULT (datetime('now')),
                 updated_at TEXT DEFAULT (datetime('now'))
             )
@@ -99,6 +101,10 @@ def init_db() -> None:
         _ensure_conference_columns(c)
         _ensure_contacts_table(c)
         c.commit()
+
+
+def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {k: row[k] for k in row.keys()}
 
 
 def create_user(username: str, password_hash: str) -> int:
@@ -142,8 +148,8 @@ def update_user_profile(
     with _conn() as c:
         c.execute(
             """
-            UPDATE users SET interests = ?, linkedin = ?, resume_text = ?,
-            profile_image_b64 = ?
+            UPDATE users
+            SET interests = ?, linkedin = ?, resume_text = ?, profile_image_b64 = ?
             WHERE id = ?
             """,
             (interests, linkedin, resume_text, profile_image_b64, user_id),
@@ -155,9 +161,9 @@ def list_conferences(user_id: int) -> list[sqlite3.Row]:
     with _conn() as c:
         cur = c.execute(
             """
-            SELECT * FROM conferences WHERE user_id = ?
-            ORDER BY COALESCE(NULLIF(event_date, ''), '9999-12-31') ASC,
-                     updated_at DESC, id DESC
+            SELECT * FROM conferences
+            WHERE user_id = ?
+            ORDER BY COALESCE(NULLIF(event_date, ''), '9999-12-31') ASC, updated_at DESC, id DESC
             """,
             (user_id,),
         )
@@ -173,12 +179,13 @@ def get_conference(conf_id: int, user_id: int) -> sqlite3.Row | None:
         return cur.fetchone()
 
 
-def create_conference(user_id: int, name: str, event_date: str = "") -> int:
+def create_conference(user_id: int, name: str, event_date: str) -> int:
     with _conn() as c:
         cur = c.execute(
             """
-            INSERT INTO conferences (user_id, name, goals, feelings, sessions_json, event_date)
-            VALUES (?, ?, '', 'A little nervous', '[]', ?)
+            INSERT INTO conferences (
+                user_id, name, goals, feelings, sessions_json, event_date, questions_json
+            ) VALUES (?, ?, '', 'A little nervous', '[]', ?, '[]')
             """,
             (user_id, name.strip() or "Untitled conference", event_date.strip()),
         )
@@ -194,6 +201,7 @@ def update_conference(
     goals: str | None = None,
     feelings: str | None = None,
     sessions: list[dict[str, Any]] | None = None,
+    questions: list[dict[str, Any]] | None = None,
     event_date: str | None = None,
     reflection_day_notes: str | None = None,
     reflection_contacts: str | None = None,
@@ -214,6 +222,9 @@ def update_conference(
     if sessions is not None:
         parts.append("sessions_json = ?")
         vals.append(json.dumps(sessions))
+    if questions is not None:
+        parts.append("questions_json = ?")
+        vals.append(json.dumps(questions))
     if event_date is not None:
         parts.append("event_date = ?")
         vals.append(event_date)
@@ -248,13 +259,10 @@ def delete_conference(conf_id: int, user_id: int) -> None:
         c.commit()
 
 
-# --- Contacts ---
-
-
 def list_contacts(user_id: int) -> list[sqlite3.Row]:
     with _conn() as c:
         cur = c.execute(
-            "SELECT * FROM contacts WHERE user_id = ? ORDER BY created_at DESC",
+            "SELECT * FROM contacts WHERE user_id = ? ORDER BY created_at DESC, id DESC",
             (user_id,),
         )
         return list(cur.fetchall())
@@ -266,11 +274,20 @@ def list_contacts_for_conference(user_id: int, conference_id: int) -> list[sqlit
             """
             SELECT * FROM contacts
             WHERE user_id = ? AND conference_id = ?
-            ORDER BY created_at DESC
+            ORDER BY created_at DESC, id DESC
             """,
             (user_id, conference_id),
         )
         return list(cur.fetchall())
+
+
+def get_contact(contact_id: int, user_id: int) -> sqlite3.Row | None:
+    with _conn() as c:
+        cur = c.execute(
+            "SELECT * FROM contacts WHERE id = ? AND user_id = ?",
+            (contact_id, user_id),
+        )
+        return cur.fetchone()
 
 
 def add_contact(
@@ -308,6 +325,64 @@ def add_contact(
         return int(cur.lastrowid)
 
 
+def update_contact(
+    contact_id: int,
+    user_id: int,
+    *,
+    conference_id: int | None,
+    name: str,
+    org: str,
+    email: str,
+    linkedin_url: str,
+    topics: str,
+    notes: str,
+    business_card_b64: str | None = None,
+) -> None:
+    with _conn() as c:
+        if business_card_b64 is None:
+            c.execute(
+                """
+                UPDATE contacts
+                SET conference_id = ?, name = ?, org = ?, email = ?, linkedin_url = ?,
+                    topics = ?, notes = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (
+                    conference_id,
+                    name,
+                    org,
+                    email,
+                    linkedin_url,
+                    topics,
+                    notes,
+                    contact_id,
+                    user_id,
+                ),
+            )
+        else:
+            c.execute(
+                """
+                UPDATE contacts
+                SET conference_id = ?, name = ?, org = ?, email = ?, linkedin_url = ?,
+                    topics = ?, notes = ?, business_card_b64 = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (
+                    conference_id,
+                    name,
+                    org,
+                    email,
+                    linkedin_url,
+                    topics,
+                    notes,
+                    business_card_b64,
+                    contact_id,
+                    user_id,
+                ),
+            )
+        c.commit()
+
+
 def delete_contact(contact_id: int, user_id: int) -> None:
     with _conn() as c:
         c.execute(
@@ -317,27 +392,17 @@ def delete_contact(contact_id: int, user_id: int) -> None:
         c.commit()
 
 
-def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    """Convert a sqlite3.Row to a plain dict (all columns)."""
-    return {k: row[k] for k in row.keys()}
-
-
-def _row_as_dict(row: sqlite3.Row) -> dict[str, Any]:
-    return row_to_dict(row)
-
-
 def export_user_data(user_id: int) -> dict[str, Any]:
-    """Structured export for GDPR-style portability (local demo)."""
     u = get_user_by_id(user_id)
     if not u:
         return {}
-    user_d = _row_as_dict(u)
+    user_d = row_to_dict(u)
     user_d.pop("password_hash", None)
-    confs = [_row_as_dict(r) for r in list_conferences(user_id)]
-    contacts = [_row_as_dict(r) for r in list_contacts(user_id)]
+    conferences = [row_to_dict(r) for r in list_conferences(user_id)]
+    contacts = [row_to_dict(r) for r in list_contacts(user_id)]
     return {
         "user": user_d,
-        "conferences": confs,
+        "conferences": conferences,
         "contacts": contacts,
-        "export_note": "Local SQLite export; remove sensitive fields before sharing publicly.",
+        "export_note": "Local export. Remove sensitive fields before sharing publicly.",
     }
