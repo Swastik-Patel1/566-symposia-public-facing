@@ -15,11 +15,23 @@ _DEFAULT_QUESTIONS = {
 }
 
 
-def _client() -> OpenAI | None:
+def _openai_client() -> OpenAI | None:
     key = os.environ.get("OPENAI_API_KEY")
     if not key:
         return None
     return OpenAI(api_key=key)
+
+
+def _gemini_client():
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        return None
+    try:
+        from google import genai  # type: ignore
+
+        return genai.Client(api_key=key)
+    except Exception:
+        return None
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -30,8 +42,35 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     return json.loads(text)
 
 
+def _gemini_generate_text(prompt: str, temperature: float) -> str | None:
+    client = _gemini_client()
+    if not client:
+        return None
+    try:
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config={"temperature": temperature},
+        )
+        return (resp.text or "").strip()
+    except Exception:
+        return None
+
+
 def generate_questions(prompt: str) -> dict[str, str]:
-    client = _client()
+    gem_txt = _gemini_generate_text(prompt, 0.7)
+    if gem_txt:
+        try:
+            data = _extract_json_object(gem_txt)
+            return {
+                "q1": str(data.get("q1", _DEFAULT_QUESTIONS["q1"])),
+                "q2": str(data.get("q2", _DEFAULT_QUESTIONS["q2"])),
+                "q3": str(data.get("q3", _DEFAULT_QUESTIONS["q3"])),
+            }
+        except Exception:
+            pass
+
+    client = _openai_client()
     if not client:
         return dict(_DEFAULT_QUESTIONS)
 
@@ -54,12 +93,15 @@ def generate_questions(prompt: str) -> dict[str, str]:
 
 
 def generate_reflection(prompt: str) -> str:
-    client = _client()
+    gem_txt = _gemini_generate_text(prompt, 0.6)
+    if gem_txt:
+        return gem_txt
+
+    client = _openai_client()
     if not client:
         return (
-            "Set **OPENAI_API_KEY** in a `.env` file (see `.env.example`) to enable "
-            "AI reflection. Meanwhile, jot down: one person to follow up with, one idea "
-            "you want to explore, and one question for tomorrow."
+            "Set **GEMINI_API_KEY** (recommended) or **OPENAI_API_KEY** in `.env` "
+            "to enable AI reflection."
         )
 
     try:
@@ -71,3 +113,41 @@ def generate_reflection(prompt: str) -> str:
         return (resp.choices[0].message.content or "").strip()
     except Exception as exc:
         return f"Could not generate reflection ({exc!r}). Check your API key and try again."
+
+
+def parse_business_card(
+    image_bytes: bytes,
+    mime_type: str,
+) -> dict[str, str]:
+    """
+    Try to infer contact fields from a business-card photo.
+    Returns keys: name, org, email, linkedin_url, topics.
+    """
+    client = _gemini_client()
+    if not client:
+        return {}
+    prompt = (
+        "Extract contact details from this business card image. "
+        "Return ONLY JSON with keys: name, org, email, linkedin_url, topics. "
+        "If unknown, use empty string."
+    )
+    try:
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                prompt,
+                {"mime_type": mime_type, "data": image_bytes},
+            ],
+            config={"temperature": 0.1},
+        )
+        txt = (resp.text or "").strip()
+        data = _extract_json_object(txt)
+        return {
+            "name": str(data.get("name", "")),
+            "org": str(data.get("org", "")),
+            "email": str(data.get("email", "")),
+            "linkedin_url": str(data.get("linkedin_url", "")),
+            "topics": str(data.get("topics", "")),
+        }
+    except Exception:
+        return {}
