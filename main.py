@@ -1,5 +1,7 @@
 """Conference Scaffolding — Streamlit app with auth, profile, and multi-conference workspaces."""
 
+import base64
+import html
 import json
 import sqlite3
 
@@ -41,24 +43,106 @@ def _apply_theme():
         """
         <style>
         .stApp {
-            background: linear-gradient(
-                135deg,
-                #ff9ecf 0%,
-                #ffb347 45%,
-                #1faa59 100%
-            );
+            background: linear-gradient(160deg, #020617 0%, #0f172a 40%, #020617 100%);
             background-attachment: fixed;
+            color: #e2e8f0;
         }
         .block-container {
-            background: rgba(255, 255, 255, 0.82);
+            background: rgba(15, 23, 42, 0.94);
             border-radius: 16px;
             padding: 2rem 2rem 2.5rem 2rem;
             margin-top: 1.5rem;
             margin-bottom: 1.5rem;
+            border: 1px solid #1e293b;
         }
-        h1, h2, h3, p, label, div {
-            color: #1f2937;
+        .main h1, .main h2, .main h3, .main p, .main label, .main span, .main li {
+            color: #e2e8f0 !important;
         }
+        .stCaption, [data-testid="stCaption"] {
+            color: #94a3b8 !important;
+        }
+        .stTextInput input,
+        .stTextArea textarea,
+        [data-baseweb="input"] input,
+        [data-baseweb="textarea"] textarea {
+            background-color: #020617 !important;
+            color: #f8fafc !important;
+            border: 1px solid #334155 !important;
+            caret-color: #f8fafc !important;
+        }
+        .stSelectbox [data-baseweb="select"] > div {
+            background-color: #020617 !important;
+            color: #f8fafc !important;
+            border-color: #334155 !important;
+        }
+        [data-testid="stSidebar"] {
+            background: linear-gradient(180deg, #000000 0%, #0f172a 100%) !important;
+            border-right: 1px solid #1e293b !important;
+        }
+        [data-testid="stSidebar"] p, [data-testid="stSidebar"] span, [data-testid="stSidebar"] label {
+            color: #e2e8f0 !important;
+        }
+        [data-testid="stSidebar"] .stButton > button[kind="primary"] {
+            background-color: #ffffff !important;
+            color: #020617 !important;
+            border: none !important;
+            font-weight: 600 !important;
+        }
+        [data-testid="stSidebar"] .stButton > button[kind="secondary"] {
+            background-color: #1e293b !important;
+            color: #f1f5f9 !important;
+            border: 1px solid #334155 !important;
+        }
+        [data-testid="stExpander"] details {
+            background-color: #0f172a !important;
+            border: 1px solid #334155 !important;
+            border-radius: 8px !important;
+        }
+        [data-testid="stExpander"] summary, [data-testid="stExpander"] summary span {
+            color: #f8fafc !important;
+        }
+        .streamlit-expanderContent {
+            background-color: #020617 !important;
+            color: #e2e8f0 !important;
+        }
+        .resume-pre {
+            color: #f1f5f9 !important;
+            background: #020617 !important;
+            padding: 1rem 1.1rem;
+            border-radius: 8px;
+            overflow-x: auto;
+            font-size: 0.9rem;
+            line-height: 1.45;
+            border: 1px solid #334155;
+        }
+        .cs-avatar-wrap {
+            position: fixed;
+            top: 0.85rem;
+            right: 1rem;
+            z-index: 1000000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .cs-avatar, .cs-avatar-placeholder {
+            width: 56px;
+            height: 56px;
+            border-radius: 50%;
+            object-fit: cover;
+            border: 3px solid #e2e8f0;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.45);
+        }
+        .cs-avatar-placeholder {
+            background: #334155;
+            color: #f8fafc;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 1.25rem;
+            font-family: system-ui, sans-serif;
+        }
+        [data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -72,15 +156,41 @@ def _logout():
 
 
 def _seed_profile_from_db(user_id: int) -> None:
+    """Load DB profile into stable session keys (widgets unmount when switching pages)."""
     if st.session_state.get("_seed_uid") == user_id:
         return
     u = get_user_by_id(user_id)
     if not u:
         return
-    st.session_state["prof_interests"] = u["interests"] or ""
-    st.session_state["prof_linkedin"] = u["linkedin"] or ""
+    st.session_state["_prof_interests_stored"] = u["interests"] or ""
+    st.session_state["_prof_linkedin_stored"] = u["linkedin"] or ""
     st.session_state["resume_text"] = u["resume_text"] or ""
+    img = u["profile_image_b64"] if "profile_image_b64" in u.keys() else ""
+    img = img or ""
+    st.session_state["_profile_image_data_url_stored"] = img
+    st.session_state.pop("_profile_image_pending", None)
     st.session_state["_seed_uid"] = user_id
+
+
+def _profile_image_url() -> str:
+    return (
+        st.session_state.get("_profile_image_pending")
+        or st.session_state.get("_profile_image_data_url_stored")
+        or ""
+    )
+
+
+def _render_avatar_top_right(username: str) -> None:
+    url = _profile_image_url()
+    initial = (username[:1] or "?").upper()
+    if url:
+        inner = f'<img class="cs-avatar" src="{html.escape(url)}" alt="Profile photo" />'
+    else:
+        inner = f'<div class="cs-avatar-placeholder">{html.escape(initial)}</div>'
+    st.markdown(
+        f'<div class="cs-avatar-wrap">{inner}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def _render_auth():
@@ -127,21 +237,46 @@ def _render_auth():
 
 def _render_profile(user_id: int):
     st.header("Your profile")
-    st.write("Interests, LinkedIn, and resume are saved to your account and reused for every conference.")
+    st.write(
+        "Interests, LinkedIn, resume, and profile photo are saved to your account. "
+        "Fields stay filled when you switch pages — click **Save profile** to write them to the database."
+    )
+
+    # Widget keys are cleared when this page unmounts; re-seed from stable copies.
+    if "prof_interests_ui" not in st.session_state:
+        st.session_state["prof_interests_ui"] = st.session_state.get("_prof_interests_stored", "")
+    if "prof_linkedin_ui" not in st.session_state:
+        st.session_state["prof_linkedin_ui"] = st.session_state.get("_prof_linkedin_stored", "")
 
     col1, col2 = st.columns(2)
     with col1:
         st.text_area(
             "Interests",
             height=120,
-            key="prof_interests",
+            key="prof_interests_ui",
             placeholder="e.g. climate policy, HCI, first-gen student support",
         )
     with col2:
         st.text_input(
             "LinkedIn profile URL (optional)",
-            key="prof_linkedin",
+            key="prof_linkedin_ui",
         )
+
+    st.subheader("Profile photo")
+    pic = st.file_uploader(
+        "Upload a profile picture (JPG or PNG)",
+        type=["png", "jpg", "jpeg"],
+        key="prof_pic_uploader",
+    )
+    if pic is not None:
+        raw = pic.read()
+        if len(raw) > 500_000:
+            st.error("Image must be under 500 KB. Try a smaller file.")
+        else:
+            b64s = base64.b64encode(raw).decode("ascii")
+            mime = pic.type or "image/jpeg"
+            st.session_state["_profile_image_pending"] = f"data:{mime};base64,{b64s}"
+            st.success("Photo loaded — click **Save profile** to store it.")
 
     resume_file = st.file_uploader(
         "Resume (PDF or TXT)",
@@ -153,18 +288,42 @@ def _render_profile(user_id: int):
         st.success(f"Resume loaded ({len(st.session_state.resume_text)} characters). Click Save to store.")
 
     if st.button("Save profile", type="primary", key="prof_save"):
+        interests_val = st.session_state.get(
+            "prof_interests_ui", st.session_state.get("_prof_interests_stored", "")
+        )
+        linkedin_val = st.session_state.get(
+            "prof_linkedin_ui", st.session_state.get("_prof_linkedin_stored", "")
+        )
+        st.session_state["_prof_interests_stored"] = interests_val
+        st.session_state["_prof_linkedin_stored"] = linkedin_val
+        resume_val = st.session_state.get("resume_text") or ""
+        img_val = _profile_image_url()
         update_user_profile(
             user_id,
-            st.session_state.get("prof_interests") or "",
-            st.session_state.get("prof_linkedin") or "",
-            st.session_state.get("resume_text") or "",
+            interests_val,
+            linkedin_val,
+            resume_val,
+            profile_image_b64=img_val,
         )
+        st.session_state["_profile_image_data_url_stored"] = img_val
+        st.session_state.pop("_profile_image_pending", None)
         st.success("Profile saved.")
+
+    st.session_state["_prof_interests_stored"] = st.session_state.get(
+        "prof_interests_ui", st.session_state.get("_prof_interests_stored", "")
+    )
+    st.session_state["_prof_linkedin_stored"] = st.session_state.get(
+        "prof_linkedin_ui", st.session_state.get("_prof_linkedin_stored", "")
+    )
 
     rt = st.session_state.get("resume_text") or ""
     if rt:
         with st.expander("Saved resume preview (first 800 characters)"):
-            st.text(rt[:800] + ("…" if len(rt) > 800 else ""))
+            snippet = rt[:800] + ("…" if len(rt) > 800 else "")
+            st.markdown(
+                f'<pre class="resume-pre">{html.escape(snippet)}</pre>',
+                unsafe_allow_html=True,
+            )
 
 
 def _sessions_from_row(row) -> list:
@@ -276,7 +435,11 @@ def _render_conference_workspace(user_id: int):
             "and this conference’s goals and feelings."
         )
         u = get_user_by_id(user_id)
-        interests = (u["interests"] if u else "") or "(not specified)"
+        interests = (
+            st.session_state.get("_prof_interests_stored")
+            or (u["interests"] if u else "")
+            or "(not specified)"
+        )
         resume_preview = st.session_state.get("resume_text") or (
             (u["resume_text"] if u else "") or "(no resume saved — add one in Profile)"
         )
@@ -378,17 +541,35 @@ def main():
     username = st.session_state.get("auth_username", "user")
     _seed_profile_from_db(user_id)
 
+    if "nav_page" not in st.session_state:
+        st.session_state.nav_page = "My profile"
+
     with st.sidebar:
         st.markdown("### Account")
         st.write(f"Signed in as **{username}**")
         if st.button("Log out"):
             _logout()
         st.divider()
-        page = st.radio(
-            "Go to",
-            ["My profile", "My conferences"],
-            label_visibility="collapsed",
-        )
+        st.markdown("**Pages**")
+        nav = st.session_state.nav_page
+        if st.button(
+            "My profile",
+            key="nav_btn_profile",
+            use_container_width=True,
+            type="primary" if nav == "My profile" else "secondary",
+        ):
+            st.session_state.nav_page = "My profile"
+            st.rerun()
+        if st.button(
+            "My conferences",
+            key="nav_btn_conf",
+            use_container_width=True,
+            type="primary" if nav == "My conferences" else "secondary",
+        ):
+            st.session_state.nav_page = "My conferences"
+            st.rerun()
+
+    _render_avatar_top_right(username)
 
     st.title("Conference Scaffolding")
     st.caption(
@@ -396,7 +577,7 @@ def main():
         "saved profile and one workspace per conference."
     )
 
-    if page == "My profile":
+    if st.session_state.nav_page == "My profile":
         _render_profile(user_id)
     else:
         _render_conference_workspace(user_id)
